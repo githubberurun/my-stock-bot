@@ -1,0 +1,7 @@
+pandas
+yfinance
+requests
+openpyxl
+google-genai
+gspread
+google-auth
