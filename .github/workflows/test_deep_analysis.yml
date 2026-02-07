@@ -1,0 +1,41 @@
+name: Daily Stock Analysis_deep analysis
+on:
+  push:
+    branches:
+      - feature-deep-analysis  # このブランチに保存した時だけ自動で動くようにします
+  workflow_dispatch:           # ボタンでの手動実行も残しておきます
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # 深層分析に必要なライブラリを追加
+          pip install yfinance gspread oauth2client beautifulsoup4
+
+      # 1. 既存の分析を実行（Google用スプレッドシートが更新される）
+      - name: Run analysis
+        env:
+          GEMINI_API_KEY: XXXX
+          GOOGLE_SERVICE_ACCOUNT_JSON: XXXX
+          SPREADSHEET_ID: XXXX
+        run: python main.py
+
+      # 2. 【追加】深層分析を実行（ハイスコア深層分析スプレッドシートが更新される）
+      - name: Run Deep Analysis
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python deep_analyzer.py
