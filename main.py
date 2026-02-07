@@ -63,6 +63,12 @@ ws.append_row(header)
 
 for i, item in enumerate(selected_data[:200]):
     try:
+        # --- 【修正点1】ループ毎に変数を完全に初期化し、累積を根絶 ---
+        score = 50
+        ai_val = 0
+        ai_fx = "中立"
+        ai_diag = ""
+        
         s = yf.Ticker(item['ticker']); inf = s.info; hist = s.history(period="3mo")
         strategy = "Blue-Chip Strategy" if i < 100 else "Deep Value Strategy"
         
@@ -77,8 +83,8 @@ for i, item in enumerate(selected_data[:200]):
         div_rate = float(inf.get('dividendRate', 0))
         
         # 独自指標の計算
-        range_upper = max(eps * 12, div_rate / 0.04) # レンジ上限
-        range_lower = (item['price'] / pbr) * 0.8 if pbr > 0 else item['price'] * 0.7 # レンジ下限
+        range_upper = max(eps * 12, div_rate / 0.04) 
+        range_lower = (item['price'] / pbr) * 0.8 if pbr > 0 else item['price'] * 0.7 
         fcf = (float(inf.get('operatingCashflow', 0)) + float(inf.get('investingCashflow', 0))) / 1e6
         net_cash = (float(inf.get('totalCash', 0)) - float(inf.get('totalDebt', 0))) / 1e6
 
@@ -91,36 +97,41 @@ for i, item in enumerate(selected_data[:200]):
             dev = ((close.iloc[-1] - close.rolling(25).mean().iloc[-1]) / close.rolling(25).mean().iloc[-1]) * 100
 
         # --- 精緻なスコアリング (ベース 50点) ---
-        score = 50
-        if roe > 10: score += 2  # 収益性
+        if roe > 10: score += 2 
         if roe > 15: score += 1
-        if pbr < 1.0: score += 2 # 割安性
-        if yld > 3.5: score += 2 # 高利回り
-        if eq_ratio > 50: score += 1 # 安全性
-        if net_cash > 0: score += 1  # 財務余力
-        if rsi < 35: score += 2      # テクニカル割安
-        elif rsi > 70: score -= 3    # テクニカル過熱減点
+        if pbr < 1.0: score += 2 
+        if yld > 3.5: score += 2 
+        if eq_ratio > 50: score += 1 
+        if net_cash > 0: score += 1  
+        if rsi < 35: score += 2      
+        elif rsi > 70: score -= 3    
 
-        # AI診断 (質的補正)
+        # AI診断
         prompt = (f"銘柄:{item['row']['社名']}, 業種:{item['row']['業種']}, ROE:{roe:.1f}%。 "
                   f"為替判定を『円安恩恵/円高恩恵/中立』から1つ選択。加減点(-5〜+5)と診断(40字)を回答。"
                   f"『加減点|為替|診断』の形式で。")
         res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip()
         
-        ai_fx = "中立"
+        # --- 【修正点2】AIの回答から今回の加点分のみを抽出 ---
         if "|" in res:
             parts = res.split("|")
-            try: score += int(re.search(r'([-+]?\d+)', parts[0]).group(1))
-            except: pass
-            # 為替ラベルの強制統一
+            try: 
+                ai_val = int(re.search(r'([-+]?\d+)', parts[0]).group(1))
+            except: 
+                ai_val = 0
             ai_fx = "円安恩恵" if "円安" in parts[1] else "円高恩恵" if "円高" in parts[1] else "中立"
             ai_diag = parts[-1].strip()
-        else: ai_diag = res
+        else: 
+            ai_diag = res
+            ai_val = 0
+
+        # --- 【修正点3】総合評価を独立して算出 ---
+        final_total_score = int(score + ai_val)
 
         # 最終行の構築
         final_rows.append([
             date_str, item['row']['コード'], item['row']['社名'], strategy,
-            int(score), round(item['price'], 1), item['change'], ai_fx,
+            final_total_score, round(item['price'], 1), item['change'], ai_fx,
             round(range_lower, 1), round(range_upper, 1),
             round(yld, 2), round(payout, 1), round(roe, 1), round(per, 1), round(pbr, 2),
             round(eq_ratio, 1), round(fcf, 1), round(net_cash, 1),
@@ -137,7 +148,6 @@ drive_service = build('drive', 'v3', credentials=creds)
 csv_buf = io.BytesIO()
 pd.DataFrame(final_rows, columns=header).to_csv(csv_buf, index=False, encoding='utf-8-sig')
 media = MediaIoBaseUpload(csv_buf, mimetype='text/csv', resumable=True)
-# stock_dataフォルダ内の「GitHub用」という名前のファイルを更新
 files = drive_service.files().list(q="name contains 'GitHub用' and trashed = false").execute().get('files', [])
 for f in files:
     drive_service.files().update(fileId=f['id'], media_body=media).execute()
