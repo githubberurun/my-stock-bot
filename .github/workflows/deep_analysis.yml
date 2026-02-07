@@ -27,9 +27,9 @@ jobs:
       # 1. 既存の分析を実行（Google用スプレッドシートが更新される）
       - name: Run analysis
         env:
-          GEMINI_API_KEY: XXXX
-          GOOGLE_SERVICE_ACCOUNT_JSON: XXXX
-          SPREADSHEET_ID: XXXX
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python main.py
 
       # 2. 【追加】深層分析を実行（ハイスコア深層分析スプレッドシートが更新される）
