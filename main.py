@@ -30,7 +30,6 @@ def get_latest_jpx_list():
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
     res = requests.get(url)
     with io.BytesIO(res.content) as f:
-        # エラー回避のため engine='xlrd' を明示
         df = pd.read_excel(f, engine='xlrd')
         df = df[['コード', '銘柄名', '市場・商品区分', '33業種区分']]
         df.columns = ['コード', '社名', '市場', '業種']
@@ -44,7 +43,7 @@ def calculate_rsi(series, period=14):
     rs = gain / loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(50)
 
-# --- 2. 銘柄スキャン (戦略別に各100社選抜) ---
+# --- 2. 銘柄スキャン ---
 df_all = get_latest_jpx_list()
 print(f"全 {len(df_all)} 社のスキャンを開始...")
 
@@ -55,28 +54,21 @@ for i, (idx, row) in enumerate(df_all.iterrows()):
         s = yf.Ticker(ticker)
         inf = s.info
         if not inf.get('currentPrice'): continue
-        
         roe = inf.get('returnOnEquity', 0) * 100
         per = inf.get('trailingPE', 0)
         pbr = inf.get('priceToBook', 0)
         yld = inf.get('dividendYield', 0) * 100
-        
-        # 簡易スコアで選抜母集団を作成
         score = (30 if roe > 10 else 0) + (20 if yld > 3 else 0) + (20 if 0 < pbr < 1 else 0)
         data = {'ticker': ticker, 'row': row, 'score': score, 'inf': inf}
-        
         if roe > 10 and 0 < per < 25: q_candidates.append(data)
         else: v_candidates.append(data)
-        
-        # 効率化のため一定数確保したら次へ
-        if len(q_candidates) >= 350 and len(v_candidates) >= 350: break
+        if len(q_candidates) >= 300 and len(v_candidates) >= 300: break
     except: continue
 
-# 戦略ごとに上位100社、合計200社を抽出
 target_list = sorted(q_candidates, key=lambda x: x['score'], reverse=True)[:100] + \
               sorted(v_candidates, key=lambda x: x['score'], reverse=True)[:100]
 
-# --- 3. 詳細分析 (200社) ---
+# --- 3. 詳細分析 ---
 final_rows = []
 now_jst = datetime.utcnow() + timedelta(hours=9)
 date_str = now_jst.strftime("%Y-%m-%d")
@@ -87,23 +79,17 @@ for item in target_list:
         s = yf.Ticker(item['ticker'])
         hist = s.history(period="3mo")
         cp = inf.get('currentPrice')
-        
-        # 全指標の算出（見落としなし）
         eq_ratio = inf.get('equityRatio', 0) * 100
         fcf = (inf.get('operatingCashflow', 0) or 0) + (inf.get('investingCashflow', 0) or 0)
         net_cash = (inf.get('totalCash', 0) or 0) - (inf.get('totalDebt', 0) or 0)
         roe, per, pbr = inf.get('returnOnEquity', 0)*100, inf.get('trailingPE', 0), inf.get('priceToBook', 0)
         yld, payout = inf.get('dividendYield', 0)*100, inf.get('payoutRatio', 0)*100
         rev_g, eps = inf.get('revenueGrowth', 0)*100, inf.get('trailingEps', 0)
-        
         rsi = calculate_rsi(hist['Close']).iloc[-1]
         ma25 = hist['Close'].rolling(window=25).mean().iloc[-1]
         dev = ((cp - ma25) / ma25) * 100 if ma25 else 0
 
-        # AI分析
-        prompt = (f"銘柄:{row['社名']}, 業種:{row['業種']}\n"
-                  f"ROE:{roe:.1f}%, FCF:{fcf/1e6:.0f}M, 配当性向:{payout:.1f}%, 成長率:{rev_g:.1f}%\n"
-                  f"必ず「スコア(-15〜15)|為替ラベル|診断(50字以内)」で回答。")
+        prompt = f"銘柄:{row['社名']}\nROE:{roe:.1f}%, FCF:{fcf/1e6:.0f}M\n必ず「スコア(-15〜15)|為替ラベル|AI診断(50字以内)」で回答。"
         res_ai = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip().replace(",","、")
         
         ai_val, ai_fx, ai_diag = 0, "中立", res_ai
@@ -112,9 +98,7 @@ for item in target_list:
             ai_val = int(re.search(r'(-?\d+)', p[0]).group(1)) if re.search(r'(-?\d+)', p[0]) else 0
             ai_fx, ai_diag = p[1].strip(), p[-1].strip()
 
-        # 100点満点正規化スコア
         score = min(100, max(0, 50 + ai_val + (10 if roe>12 else 0) + (10 if fcf>0 else 0) + (10 if eq_ratio>40 else 0)))
-
         final_rows.append([
             date_str, row['コード'], row['社名'], 
             "クオリティ・グロース" if roe > 10 and 0 < per < 25 else "ディープ・バリュー",
@@ -125,36 +109,34 @@ for item in target_list:
         time.sleep(0.5)
     except: continue
 
-# --- 4. 保存 (Spreadsheet 新規タブ & 添付ファイル上書き) ---
+# --- 4. 保存 ---
 header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '為替ラベル', 'レンジ上限', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
 
-# A. Spreadsheet (日付が変われば新規タブ)
+# A. Spreadsheet (これは容量制限を受けません)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
-try: 
-    ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
-except: 
-    ws = sh.worksheet(date_str)
+try: ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
+except: ws = sh.worksheet(date_str)
 ws.clear()
-ws.append_row(["【凡例】", "総合評価:100点満点(収益・財務・CF統合)", "FCF:営業CF+投資CF(百万単位)", "ネットキャッシュ:実質無借金余力(百万単位)", "レンジ上限:理論上の割安上限値"])
+ws.append_row(["【凡例】", "総合評価:100点満点", "FCF:営業+投資CF", "ネットキャッシュ:現預金-負債", "25日乖離:移動平均乖離"])
 ws.append_row(header)
 ws.append_rows(final_rows)
 
-# B. Google Drive (添付ファイルを名前で検索して上書き)
+# B. Google Drive (既存ファイルを「検索」して「更新」するのみに限定)
 drive_service = build('drive', 'v3', credentials=creds)
-target_file_name = f"GitHub用 - {date_str}.csv"
-query = f"name = '{target_file_name}' and trashed = false"
-files = drive_service.files().list(q=query).execute().get('files', [])
-
-df_final = pd.DataFrame(final_rows, columns=header)
 csv_file = io.BytesIO()
-df_final.to_csv(csv_file, index=False, encoding='utf-8-sig')
+pd.DataFrame(final_rows, columns=header).to_csv(csv_file, index=False, encoding='utf-8-sig')
 media = MediaIoBaseUpload(csv_file, mimetype='text/csv', resumable=True)
 
+# サービスアカウントの容量制限を避けるため、既存のCSVファイルを検索してその「中身」を上書きする
+# ※ファイル名は「GitHub用 - 2026-02-07.csv」などで部分一致検索
+query = "name contains 'GitHub用' and trashed = false"
+files = drive_service.files().list(q=query, fields='files(id, name)').execute().get('files', [])
+
 if files:
-    drive_service.files().update(fileId=files[0]['id'], media_body=media).execute()
-    print(f"✅ 添付ファイル {target_file_name} を上書き更新しました。")
+    # 既存の全ファイル（今日の日付や過去のシート）を最新データに更新
+    for f in files:
+        drive_service.files().update(fileId=f['id'], media_body=media).execute()
+        print(f"✅ 既存ファイル {f['name']} の内容を更新しました。")
 else:
-    file_metadata = {'name': target_file_name}
-    drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    print(f"✅ 新規ファイル {target_file_name} を作成しました。")
+    print("⚠️ 更新対象のCSVファイルが見つかりませんでした。Google Drive上に 'GitHub用' を含むCSVを置いてください。")
