@@ -1,128 +1,103 @@
+import os
+import json
 import pandas as pd
 import yfinance as yf
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timedelta
 import time
+import numpy as np
 
-# --- 設定エリア ---
-# Google Sheets API設定 (JSONキーファイルが必要)
-JSON_KEY_FILE = 'path/to/your/service_account_key.json' 
-FOLDER_NAME = "Colog_GitHub用"
-SOURCE_SS_NAME = "Github用"
-DEST_SS_NAME = "ハイスコア深層分析"
+# --- 1. main.py と完全に一致させた認証設定 ---
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 
-# 家計予算設定 (Saved Informationより)
-SAVINGS_DEFENSE_FUND = 80000 # 毎月の防衛資金
+# JSONの読み込みと認証
+json_data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+creds = Credentials.from_service_account_info(json_data, scopes=[
+    'https://www.googleapis.com/auth/spreadsheets', 
+    'https://www.googleapis.com/auth/drive'
+])
+gc = gspread.authorize(creds)
 
-def get_ss_client():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEY_FILE, scope)
-    return gspread.authorize(creds)
-
-def fetch_deep_data(ticker_symbol):
-    """
-    Step 1 & 2 & 3 のロジックを統合したデータ取得
-    """
-    ticker = yf.Ticker(f"{ticker_symbol}.T")
-    info = ticker.info
-    
-    # --- Step 1: 財務深掘り (F-Score等) ---
-    # 簡易版Fスコア ( yfinanceで取得可能な範囲 )
-    f_score = 0
+def analyze_ticker(ticker_symbol):
+    """財務・需給の深掘り分析"""
     try:
-        bs = ticker.balance_sheet
-        is_stmt = ticker.financials
-        cf = ticker.cashflow
+        ticker = yf.Ticker(f"{ticker_symbol}.T")
+        inf = ticker.info
         
-        # 1. 当期純利益 > 0
-        if is_stmt.loc['Net Income'].iloc[0] > 0: f_score += 1
-        # 2. 営業CF > 0
-        if cf.loc['Operating Cash Flow'].iloc[0] > 0: f_score += 1
-        # 3. 営業CF > 純利益
-        if cf.loc['Operating Cash Flow'].iloc[0] > is_stmt.loc['Net Income'].iloc[0]: f_score += 1
-        # 4. 自己資本比率 (簡易チェック)
-        total_assets = bs.loc['Total Assets'].iloc[0]
-        equity = bs.loc['Stockholders Equity'].iloc[0]
-        if (equity / total_assets) > (bs.loc['Stockholders Equity'].iloc[1] / bs.loc['Total Assets'].iloc[1]): f_score += 1
+        # 財務健全性スコア (0-3点)
+        f_score = 0
+        # 営業CFがプラスか
+        if float(inf.get('operatingCashflow', 0)) > 0: f_score += 1
+        # 現金が負債より多いか
+        if float(inf.get('totalCash', 0)) > float(inf.get('totalDebt', 0)): f_score += 1
+        # 自己資本比率が50%以上か
+        if float(inf.get('bookValue', 0)) > 0: # 簡易判定
+            f_score += 1
+        
+        # 直近の出来高変化
+        hist = ticker.history(period="1mo")
+        vol_ratio = 1.0
+        if len(hist) > 10:
+            vol_ratio = round(hist['Volume'].tail(3).mean() / hist['Volume'].mean(), 2)
+            
+        return f_score, vol_ratio
     except:
-        f_score = "N/A"
-
-    # --- Step 2: 需給 (出来高変化) ---
-    hist = ticker.history(period="1mo")
-    vol_change = "N/A"
-    if len(hist) > 20:
-        recent_vol = hist['Volume'].tail(3).mean()
-        avg_vol = hist['Volume'].mean()
-        vol_change = round(recent_vol / avg_vol, 2)
-
-    # --- Step 3: ニュース簡易フィルター ---
-    news = ticker.news
-    bad_news_flag = "なし"
-    bad_words = ["不祥事", "下方修正", "提訴", "減配", "赤字転落"]
-    for n in news[:5]:
-        if any(word in n['title'] for word in bad_words):
-            bad_news_flag = "要警戒"
-            break
-
-    return f_score, vol_change, bad_news_flag
+        return 0, 1.0
 
 def main():
-    client = get_ss_client()
+    print("🚀 深層分析エンジン起動...")
+    sh = gc.open_by_key(SPREADSHEET_ID)
     
-    # 1. 元データ取得 (Github用)
-    source_ss = client.open(SOURCE_SS_NAME)
-    source_sheet = source_ss.get_worksheet(0) # 一番左（最新）のタブ
-    data = pd.DataFrame(source_sheet.get_all_records())
+    # 2. main.pyが作った最新のワークシート(一番左のタブ)を取得
+    # main.pyは index=0 でシートを追加しているので、一番左が最新です
+    source_ws = sh.get_worksheet(0)
+    print(f"📊 データ読み込み元: {source_ws.title}")
     
-    # 2. 分析対象(20銘柄)の抽出
-    # 総合評価60以上、Blue-Chip上位10、Deep Value上位10
-    top_blue = data[(data['戦略'] == 'Blue-Chip Strategy') & (data['総合評価'] >= 60)].nlargest(10, '総合評価')
-    top_value = data[(data['戦略'] == 'Deep Value Strategy') & (data['総合評価'] >= 60)].nlargest(10, '総合評価')
-    target_df = pd.concat([top_blue, top_value])
-
+    # 全データを取得してDataFrame化
+    raw_data = pd.DataFrame(source_ws.get_all_records())
+    
+    # 3. 分析対象の絞り込み (総合評価が高い上位20銘柄)
+    # 総合評価でソート
+    top_stocks = raw_data.sort_values('総合評価', ascending=False).head(20)
+    
     results = []
-    
-    # 3. 各銘柄を深掘り
-    for index, row in target_df.iterrows():
-        print(f"Analyzing: {row['社名']}...")
-        f_score, vol_change, news_status = fetch_deep_data(row['コード'])
+    date_str = (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d")
+
+    for _, row in top_stocks.iterrows():
+        code = row['コード']
+        print(f"🔎 銘柄分析中: {code} {row['社名']}")
         
-        # 最終判定ロジック
-        judgment = "WAIT"
-        if f_score != "N/A" and f_score >= 3 and news_status == "なし":
-            if row['RSI'] < 70: judgment = "GO"
-            
-        results.append({
-            "日付": datetime.now().strftime('%Y-%m-%d'),
-            "コード": row['コード'],
-            "社名": row['社名'],
-            "戦略": row['戦略'],
-            "総合スコア": row['総合評価'],
-            "Fスコア": f_score,
-            "出来高変化率": vol_change,
-            "ニュース警告": news_status,
-            "最終判定": judgment,
-            "備考": f"RSI:{row['RSI']}, 25日乖離:{row['25日乖離']}"
-        })
-        time.sleep(1) # API制限回避
+        f_score, v_ratio = analyze_ticker(code)
+        
+        # 判定ロジック
+        # 財務が良く(2点以上)、RSIが過熱していない(70未満)ならGO
+        judgment = "🔥強い買い" if (f_score >= 2 and row['RSI'] < 70) else "⚡️様子見"
+        if row['RSI'] < 35: judgment = "💎絶好の仕込み時"
 
-    # 4. 結果の書き込み (ハイスコア深層分析)
-    dest_ss = client.open(DEST_SS_NAME)
-    new_sheet_name = datetime.now().strftime('%Y-%m-%d')
+        results.append([
+            date_str, code, row['社名'], row['戦略'], row['総合評価'],
+            f_score, v_ratio, row['RSI'], row['AI深層診断'], judgment
+        ])
+        time.sleep(1) # API制限対策
+
+    # 4. 「ハイスコア深層分析」スプレッドシートへの書き込み
+    # ※同じスプレッドシート内に「深層分析結果」という名前の別シートを作るか、
+    # もし別ファイルにするならここを書き換えますが、まずは同じファイル内に作成します。
     
-    # 同名のシートがあれば削除して作り直す（上書き）
+    target_sheet_name = f"深層分析_{date_str}"
     try:
-        old_ws = dest_ss.worksheet(new_sheet_name)
-        dest_ss.del_worksheet(old_ws)
+        target_ws = sh.add_worksheet(title=target_sheet_name, rows="100", cols="15")
     except:
-        pass
-    
-    new_ws = dest_ss.add_worksheet(title=new_sheet_name, rows=100, cols=20)
-    output_df = pd.DataFrame(results)
-    new_ws.update([output_df.columns.values.tolist()] + output_df.values.tolist())
+        target_ws = sh.worksheet(target_sheet_name)
+        target_ws.clear()
 
-    print("深層分析が完了し、スプレッドシートを更新しました。")
+    header = ['分析日', 'コード', '社名', '戦略', '元スコア', '財務スコア(0-3)', '出来高変化率', 'RSI', 'AI診断(引用)', '最終判定']
+    target_ws.append_row(header)
+    target_ws.append_rows(results)
+    
+    print(f"✅ 全工程完了！シート「{target_sheet_name}」を確認してください。")
 
 if __name__ == "__main__":
     main()
