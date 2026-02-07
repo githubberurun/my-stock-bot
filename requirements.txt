@@ -3,6 +3,7 @@ yfinance
 requests
 numpy
 openpyxl
+xlrd
 google-genai
 gspread
 google-auth
