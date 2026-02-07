@@ -45,41 +45,48 @@ def calculate_rsi(series, period=14):
 
 # --- 2. 銘柄フルスキャン (全3800社) ---
 df_all = get_latest_jpx_list()
-print(f"全 {len(df_all)} 社のスキャンを開始...")
+print(f"全 {len(df_all)} 社のスキャンを開始（絶対条件を緩和し、相対評価で200社選抜）...")
 
-all_candidates = []
+all_results = []
 for i, (idx, row) in enumerate(df_all.iterrows()):
     ticker = f"{str(row['コード']).strip()}.T"
     try:
         s = yf.Ticker(ticker)
         inf = s.info
-        if not inf.get('currentPrice'): continue
+        cp = inf.get('currentPrice')
+        if not cp: continue
         
         roe = inf.get('returnOnEquity', 0) * 100
-        per = inf.get('trailingPE', 0)
-        pbr = inf.get('priceToBook', 0)
+        per = inf.get('trailingPE', 100) # なければ割高扱い
+        pbr = inf.get('priceToBook', 10)
         yld = inf.get('dividendYield', 0) * 100
         
-        # 評価点（ここで3800社から絞り込み）
-        score = (30 if roe > 10 else 0) + (20 if yld > 3.5 else 0) + (20 if 0 < pbr < 1 else 0)
+        # スコアリング（条件を厳しくせず、良質な順に並べるため）
+        score = (roe * 2) + (yld * 5) + (20 if pbr < 1.2 else 0) - (per * 0.1)
         
-        all_candidates.append({
+        all_results.append({
             'ticker': ticker, 'row': row, 'score': score, 'inf': inf,
-            'is_growth': (roe > 10 and 0 < per < 25)
+            'is_growth': (roe > 8 and per < 30) # 緩めの判定
         })
-        if (i + 1) % 500 == 0: print(f"{i+1}社完了...")
+        if (i + 1) % 500 == 0: print(f"{i+1}社スキャン完了...")
     except: continue
 
-# 上位100社ずつ抽出
-q_top = sorted([c for c in all_candidates if c['is_growth']], key=lambda x: x['score'], reverse=True)[:100]
-v_top = sorted([c for c in all_candidates if not c['is_growth']], key=lambda x: x['score'], reverse=True)[:100]
+# データ不足回避：強制的にスコア順で各100社ずつ
+q_top = sorted([c for c in all_results if c['is_growth']], key=lambda x: x['score'], reverse=True)[:100]
+v_top = sorted([c for c in all_results if not c['is_growth']], key=lambda x: x['score'], reverse=True)[:100]
+
+# 万が一growth側が100社に満たない場合は全体から補充
 target_list = q_top + v_top
+if len(target_list) < 200:
+    remaining = sorted([c for c in all_results if c not in target_list], key=lambda x: x['score'], reverse=True)
+    target_list += remaining[:(200 - len(target_list))]
 
 # --- 3. 詳細分析 (200社) ---
 final_rows = []
 now_jst = datetime.utcnow() + timedelta(hours=9)
 date_str = now_jst.strftime("%Y-%m-%d")
 
+print(f"{len(target_list)}社の詳細分析・AI診断を開始します...")
 for item in target_list:
     inf, row = item['inf'], item['row']
     try:
@@ -87,7 +94,6 @@ for item in target_list:
         hist = s.history(period="3mo")
         cp = inf.get('currentPrice')
         
-        # 15指標算出
         eq_ratio = inf.get('equityRatio', 0) * 100
         fcf = (inf.get('operatingCashflow', 0) or 0) + (inf.get('investingCashflow', 0) or 0)
         net_cash = (inf.get('totalCash', 0) or 0) - (inf.get('totalDebt', 0) or 0)
@@ -98,8 +104,7 @@ for item in target_list:
         ma25 = hist['Close'].rolling(window=25).mean().iloc[-1]
         dev = ((cp - ma25) / ma25) * 100 if ma25 else 0
 
-        # AI分析
-        prompt = f"銘柄:{row['社名']}\nROE:{roe:.1f}%, FCF:{fcf/1e6:.0f}M\n「スコア(-15〜15)|為替ラベル|診断(50字以内)」で回答。"
+        prompt = f"銘柄:{row['社名']}\nROE:{roe:.1f}%, 利回り:{yld:.1f}%\n「スコア(-15〜15)|為替ラベル|診断(50字以内)」で回答。"
         res_ai = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip().replace(",","、")
         
         ai_val, ai_fx, ai_diag = 0, "中立", res_ai
@@ -108,7 +113,7 @@ for item in target_list:
             ai_val = int(re.search(r'(-?\d+)', p[0]).group(1)) if re.search(r'(-?\d+)', p[0]) else 0
             ai_fx, ai_diag = p[1].strip(), p[-1].strip()
 
-        score = min(100, max(0, 50 + ai_val + (10 if roe>12 else 0) + (10 if fcf>0 else 0) + (10 if eq_ratio>40 else 0)))
+        score = min(100, max(0, 50 + ai_val + (10 if roe>10 else 0) + (10 if fcf>0 else 0)))
 
         final_rows.append([
             date_str, row['コード'], row['社名'], 
@@ -117,37 +122,25 @@ for item in target_list:
             round(yld, 2), round(payout, 1), round(roe, 1), round(per, 1), round(pbr, 2),
             round(eq_ratio, 1), round(fcf/1e6, 1), round(net_cash/1e6, 1), round(rsi, 1), round(dev, 1), ai_diag[:150]
         ])
-        time.sleep(0.5)
+        time.sleep(0.4)
     except: continue
 
-# --- 4. 保存実行 ---
-if not final_rows:
-    print("❌ データが空のため保存を中止しました。")
-    exit()
-
+# --- 4. 保存 ---
 header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '為替ラベル', 'レンジ上限', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
-
-# A. Spreadsheet (日付名のタブを作成/更新)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
-try:
-    ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
-except:
-    ws = sh.worksheet(date_str)
+try: ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
+except: ws = sh.worksheet(date_str)
 ws.clear()
-ws.append_row(["【凡例】", "総合評価:100点満点", "FCF:営業+投資CF", "ネットキャッシュ:現預金-負債"])
 ws.append_row(header)
 ws.append_rows(final_rows)
 
-# B. Drive CSV (既存の「GitHub用」を含むファイルを更新)
 drive_service = build('drive', 'v3', credentials=creds)
 csv_file = io.BytesIO()
 pd.DataFrame(final_rows, columns=header).to_csv(csv_file, index=False, encoding='utf-8-sig')
 media = MediaIoBaseUpload(csv_file, mimetype='text/csv', resumable=True)
-
 query = "name contains 'GitHub用' and trashed = false"
 files = drive_service.files().list(q=query, fields='files(id, name)').execute().get('files', [])
-if files:
-    for f in files:
-        drive_service.files().update(fileId=f['id'], media_body=media).execute()
-        print(f"✅ {f['name']} を {len(final_rows)}件のデータで更新しました。")
+for f in files:
+    drive_service.files().update(fileId=f['id'], media_body=media).execute()
+    print(f"✅ {f['name']} を更新完了。")
