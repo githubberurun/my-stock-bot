@@ -63,16 +63,16 @@ ws.append_row(header)
 
 for i, item in enumerate(selected_data[:200]):
     try:
-        # --- 【修正点1】ループ毎に変数を完全に初期化し、累積を根絶 ---
+        # --- 【重要修正】銘柄ごとに変数を完全に初期化 ---
         score = 50
         ai_val = 0
         ai_fx = "中立"
         ai_diag = ""
-        
+
         s = yf.Ticker(item['ticker']); inf = s.info; hist = s.history(period="3mo")
         strategy = "Blue-Chip Strategy" if i < 100 else "Deep Value Strategy"
         
-        # 指標取得 (15指標＋α)
+        # 指標取得 (15指標＋α：そのまま維持)
         roe = float(inf.get('returnOnEquity', 0)) * 100
         pbr = float(inf.get('priceToBook', 0))
         per = float(inf.get('trailingPE', 0))
@@ -82,13 +82,13 @@ for i, item in enumerate(selected_data[:200]):
         eps = float(inf.get('trailingEps', 0))
         div_rate = float(inf.get('dividendRate', 0))
         
-        # 独自指標の計算
+        # 独自指標の計算 (そのまま維持)
         range_upper = max(eps * 12, div_rate / 0.04) 
         range_lower = (item['price'] / pbr) * 0.8 if pbr > 0 else item['price'] * 0.7 
         fcf = (float(inf.get('operatingCashflow', 0)) + float(inf.get('investingCashflow', 0))) / 1e6
         net_cash = (float(inf.get('totalCash', 0)) - float(inf.get('totalDebt', 0))) / 1e6
 
-        # テクニカル算出
+        # テクニカル算出 (そのまま維持)
         close = hist['Close']
         rsi, dev = 50.0, 0.0
         if len(close) >= 25:
@@ -96,7 +96,7 @@ for i, item in enumerate(selected_data[:200]):
             rsi = (100 - (100 / (1 + (g/l.replace(0, np.nan))))).iloc[-1]
             dev = ((close.iloc[-1] - close.rolling(25).mean().iloc[-1]) / close.rolling(25).mean().iloc[-1]) * 100
 
-        # --- 精緻なスコアリング (ベース 50点) ---
+        # --- スコアリングロジック (そのまま維持) ---
         if roe > 10: score += 2 
         if roe > 15: score += 1
         if pbr < 1.0: score += 2 
@@ -109,10 +109,10 @@ for i, item in enumerate(selected_data[:200]):
         # AI診断
         prompt = (f"銘柄:{item['row']['社名']}, 業種:{item['row']['業種']}, ROE:{roe:.1f}%。 "
                   f"為替判定を『円安恩恵/円高恩恵/中立』から1つ選択。加減点(-5〜+5)と診断(40字)を回答。"
-                  f"『加減点|為替|診断』の形式で。")
+                  f"『加減点|為替|診断』の形式で。余計な文章は不要。")
         res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip()
         
-        # --- 【修正点2】AIの回答から今回の加点分のみを抽出 ---
+        # --- 【重要修正】AI診断結果を安全に抽出 ---
         if "|" in res:
             parts = res.split("|")
             try: 
@@ -125,7 +125,7 @@ for i, item in enumerate(selected_data[:200]):
             ai_diag = res
             ai_val = 0
 
-        # --- 【修正点3】総合評価を独立して算出 ---
+        # --- 【重要修正】今回の銘柄だけのスコアを確定 ---
         final_total_score = int(score + ai_val)
 
         # 最終行の構築
@@ -141,7 +141,9 @@ for i, item in enumerate(selected_data[:200]):
         if len(final_rows) % 10 == 0:
             ws.append_rows(final_rows[-10:])
             print(f"✅ {len(final_rows)}/200 完了")
-    except: continue
+    except Exception as e:
+        print(f"⚠️ エラー回避 ({item['ticker']}): {e}")
+        continue
 
 # --- 3. CSVバックアップ保存 ---
 drive_service = build('drive', 'v3', credentials=creds)
