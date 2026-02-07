@@ -1,8 +1,11 @@
 pandas
 yfinance
 requests
+numpy
 openpyxl
-xlrd
 google-genai
 gspread
 google-auth
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
