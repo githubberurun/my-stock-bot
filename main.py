@@ -1,6 +1,5 @@
 import pandas as pd
 import yfinance as yf
-import time
 import io
 import requests
 import re
@@ -14,10 +13,10 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# --- 設定 ---
+# --- 設定と認証 ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID') # IDでの指定を優先
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 
 client = Client(api_key=GEMINI_API_KEY)
 json_data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -33,13 +32,13 @@ def get_latest_jpx_list():
     df.columns = ['コード', '社名', '市場', '業種']
     return df[df['市場'].str.contains('プライム|スタンダード|グロース', na=False)].copy()
 
-# --- 1. スキャン (200社選抜) ---
+# --- 1. スキャン (3800社から200社を選抜) ---
 df_all = get_latest_jpx_list()
-print("📡 全3800社から Blue-Chip と Deep Value 候補を抽出...")
+print("📡 3800銘柄からBlue-ChipとDeep Value候補を選抜中...")
 tickers = [f"{str(c).strip()}.T" for c in df_all['コード']]
 selected_data = []
 
-# 時価総額上位から200社を確定
+# 時価総額・流動性等を考慮した一括ダウンロード
 for i in range(0, 400, 100):
     batch = tickers[i:i+100]
     data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
@@ -47,56 +46,43 @@ for i in range(0, 400, 100):
         try:
             h = data[t]
             if len(h) >= 2:
-                p = float(h['Close'].iloc[-1])
-                pc = float(h['Close'].iloc[-2])
-                chg = ((p - pc) / pc) * 100
-                row = df_all[df_all['コード'] == int(t.split('.')[0])].iloc[0]
-                selected_data.append({'ticker': t, 'row': row, 'price': p, 'change': f"{chg:+.2f}%"})
+                p = float(h['Close'].iloc[-1]); pc = float(h['Close'].iloc[-2])
+                selected_data.append({'ticker': t, 'row': df_all[df_all['コード'] == int(t.split('.')[0])].iloc[0], 'price': p, 'change': f"{((p - pc) / pc) * 100:+.2f}%"})
         except: continue
     if len(selected_data) >= 200: break
 
-# --- 2. 精密分析 ---
+# --- 2. 精密分析 (15指標と精緻なスコアリング) ---
 final_rows = []
-header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '前日比', '為替ラベル', 'レンジ上限', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
+header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '前日比', '為替ラベル', 'レンジ下限', 'レンジ上限', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
 date_str = (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d")
 
-# スプレッドシート接続（ID優先、失敗したら名前で検索）
-gc = gspread.authorize(creds)
-try:
-    sh = gc.open_by_key(SPREADSHEET_ID)
-except:
-    try: sh = gc.open('Github用')
-    except Exception as e:
-        print(f"❌ スプレッドシートの接続に失敗: {e}")
-        exit()
-
-try:
-    ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
-except:
-    ws = sh.worksheet(date_str); ws.clear()
+gc = gspread.authorize(creds); sh = gc.open_by_key(SPREADSHEET_ID)
+try: ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
+except: ws = sh.worksheet(date_str); ws.clear()
 ws.append_row(header)
-
-print("🤖 分析を開始します...")
 
 for i, item in enumerate(selected_data[:200]):
     try:
-        s = yf.Ticker(item['ticker'])
-        inf = s.info
-        hist = s.history(period="3mo")
-        
-        # 戦略名を専門用語で確定
+        s = yf.Ticker(item['ticker']); inf = s.info; hist = s.history(period="3mo")
         strategy = "Blue-Chip Strategy" if i < 100 else "Deep Value Strategy"
         
-        # 財務指標ロジック
+        # 指標取得 (15指標＋α)
         roe = float(inf.get('returnOnEquity', 0)) * 100
+        pbr = float(inf.get('priceToBook', 0))
+        per = float(inf.get('trailingPE', 0))
         yld = float(inf.get('dividendYield', 0)) * 100
-        fcf = (float(inf.get('operatingCashflow', 0)) + float(inf.get('investingCashflow', 0))) / 1e6
-        net_cash = (float(inf.get('totalCash', 0)) - float(inf.get('totalDebt', 0))) / 1e6
+        payout = float(inf.get('payoutRatio', 0)) * 100
+        eq_ratio = float(inf.get('equityRatio', 0)) * 100 or 50
         eps = float(inf.get('trailingEps', 0))
         div_rate = float(inf.get('dividendRate', 0))
-        upper_limit = max(eps * 12, div_rate / 0.04)
+        
+        # 独自指標の計算
+        range_upper = max(eps * 12, div_rate / 0.04) # レンジ上限
+        range_lower = (item['price'] / pbr) * 0.8 if pbr > 0 else item['price'] * 0.7 # レンジ下限
+        fcf = (float(inf.get('operatingCashflow', 0)) + float(inf.get('investingCashflow', 0))) / 1e6
+        net_cash = (float(inf.get('totalCash', 0)) - float(inf.get('totalDebt', 0))) / 1e6
 
-        # テクニカル
+        # テクニカル算出
         close = hist['Close']
         rsi, dev = 50.0, 0.0
         if len(close) >= 25:
@@ -104,20 +90,41 @@ for i, item in enumerate(selected_data[:200]):
             rsi = (100 - (100 / (1 + (g/l.replace(0, np.nan))))).iloc[-1]
             dev = ((close.iloc[-1] - close.rolling(25).mean().iloc[-1]) / close.rolling(25).mean().iloc[-1]) * 100
 
-        # AI分析
-        prompt = f"銘柄:{item['row']['社名']}, 業種:{item['row']['業種']}, ROE:{roe:.1f}%。為替影響を含め「スコア|為替|診断(40字)」で回答。"
+        # --- 精緻なスコアリング (ベース 50点) ---
+        score = 50
+        if roe > 10: score += 2  # 収益性
+        if roe > 15: score += 1
+        if pbr < 1.0: score += 2 # 割安性
+        if yld > 3.5: score += 2 # 高利回り
+        if eq_ratio > 50: score += 1 # 安全性
+        if net_cash > 0: score += 1  # 財務余力
+        if rsi < 35: score += 2      # テクニカル割安
+        elif rsi > 70: score -= 3    # テクニカル過熱減点
+
+        # AI診断 (質的補正)
+        prompt = (f"銘柄:{item['row']['社名']}, 業種:{item['row']['業種']}, ROE:{roe:.1f}%。 "
+                  f"為替判定を『円安恩恵/円高恩恵/中立』から1つ選択。加減点(-5〜+5)と診断(40字)を回答。"
+                  f"『加減点|為替|診断』の形式で。")
         res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip()
         
-        ai_s, ai_fx, ai_d = 0, "中立", res
+        ai_fx = "中立"
         if "|" in res:
-            p = res.split("|"); ai_s = int(re.search(r'(-?\d+)', p[0]).group(1)) if re.search(r'(-?\d+)', p[0]) else 0
-            ai_fx, ai_d = p[1].strip(), p[-1].strip()
+            parts = res.split("|")
+            try: score += int(re.search(r'([-+]?\d+)', parts[0]).group(1))
+            except: pass
+            # 為替ラベルの強制統一
+            ai_fx = "円安恩恵" if "円安" in parts[1] else "円高恩恵" if "円高" in parts[1] else "中立"
+            ai_diag = parts[-1].strip()
+        else: ai_diag = res
 
+        # 最終行の構築
         final_rows.append([
             date_str, item['row']['コード'], item['row']['社名'], strategy,
-            int(50 + ai_s), round(item['price'], 1), item['change'], ai_fx, round(upper_limit, 1),
-            round(yld, 2), round(inf.get('payoutRatio', 0)*100, 1), round(roe, 1), round(inf.get('trailingPE', 0), 1), round(inf.get('priceToBook', 0), 2),
-            round(inf.get('equityRatio', 0)*100 or 50, 1), round(fcf, 1), round(net_cash, 1), round(rsi, 1), round(dev, 1), ai_d[:150]
+            int(score), round(item['price'], 1), item['change'], ai_fx,
+            round(range_lower, 1), round(range_upper, 1),
+            round(yld, 2), round(payout, 1), round(roe, 1), round(per, 1), round(pbr, 2),
+            round(eq_ratio, 1), round(fcf, 1), round(net_cash, 1),
+            round(rsi, 1), round(dev, 1), ai_diag[:150]
         ])
         
         if len(final_rows) % 10 == 0:
@@ -125,11 +132,12 @@ for i, item in enumerate(selected_data[:200]):
             print(f"✅ {len(final_rows)}/200 完了")
     except: continue
 
-# 同期
+# --- 3. CSVバックアップ保存 ---
 drive_service = build('drive', 'v3', credentials=creds)
 csv_buf = io.BytesIO()
 pd.DataFrame(final_rows, columns=header).to_csv(csv_buf, index=False, encoding='utf-8-sig')
 media = MediaIoBaseUpload(csv_buf, mimetype='text/csv', resumable=True)
+# stock_dataフォルダ内の「GitHub用」という名前のファイルを更新
 files = drive_service.files().list(q="name contains 'GitHub用' and trashed = false").execute().get('files', [])
 for f in files:
     drive_service.files().update(fileId=f['id'], media_body=media).execute()
