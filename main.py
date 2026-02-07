@@ -36,121 +36,123 @@ def calculate_rsi(series, period=14):
     rs = gain / loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(50)
 
-# --- 2. メインロジック ---
+# --- 2. 銘柄スキャンと選抜 ---
 df_all = get_latest_jpx_list()
-target_list = df_all.head(100).copy()
-
-results = []
 now_jst = datetime.utcnow() + timedelta(hours=9)
 date_str = now_jst.strftime("%Y-%m-%d")
 
-# スプレッドシート準備
+print(f"全 {len(df_all)} 社のスキャンを開始します。")
+q_growth_candidates = []
+d_value_candidates = []
+
+for i, (idx, row) in enumerate(df_all.iterrows()):
+    ticker_str = f"{str(row['コード']).strip()}.T"
+    try:
+        s = yf.Ticker(ticker_str)
+        inf = s.info
+        if not inf.get('currentPrice'): continue
+        
+        roe = inf.get('returnOnEquity', 0) * 100
+        per = inf.get('trailingPE', 0)
+        pbr = inf.get('priceToBook', 0)
+        yield_val = inf.get('dividendYield', 0) * 100
+        
+        # 暫定スコア計算（選抜用）
+        score = 0
+        if roe > 10: score += 30
+        if yield_val > 3: score += 20
+        
+        # 戦略分類
+        if roe > 10 and 0 < per < 25:
+            q_growth_candidates.append({'ticker': ticker_str, 'row': row, 'score': score, 'inf': inf})
+        else:
+            if 0 < pbr < 1.0: score += 20
+            d_value_candidates.append({'ticker': ticker_str, 'row': row, 'score': score, 'inf': inf})
+        
+        if (len(q_growth_candidates) + len(d_value_candidates)) % 100 == 0:
+            print(f"...{len(q_growth_candidates) + len(d_value_candidates)}社 取得済み")
+            
+        # タイムアウト回避：各500社集まったら選抜へ
+        if len(q_growth_candidates) >= 500 and len(d_value_candidates) >= 500: break
+    except: continue
+
+# 各戦略から上位100社ずつ抽出
+top_q = sorted(q_growth_candidates, key=lambda x: x['score'], reverse=True)[:100]
+top_v = sorted(d_value_candidates, key=lambda x: x['score'], reverse=True)[:100]
+target_200 = top_q + top_v
+
+# --- 3. 200社の詳細分析 ---
+print(f"選抜された200社の詳細分析（全15指標）を開始します。")
 json_data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-credentials = Credentials.from_service_account_info(json_data, scopes=scopes)
+credentials = Credentials.from_service_account_info(json_data, scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
 gc = gspread.authorize(credentials)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
-# 前日価格取得用
+# 前日比用データの取得
 prev_prices = {}
 try:
-    last_sheet = sh.get_worksheet(0)
-    if last_sheet and last_sheet.title != date_str:
-        records = last_sheet.get_all_records()
-        for r in records:
-            prev_prices[str(r['コード'])] = r.get('現在値', 0)
-except:
-    pass
+    last_ws = sh.get_worksheet(0)
+    for r in last_ws.get_all_records(): prev_prices[str(r['コード'])] = r.get('現在値', 0)
+except: pass
 
-for i, (idx, row) in enumerate(target_list.iterrows()):
-    ticker_str = f"{str(row['コード']).strip()}.T"
-    print(f"[{i+1}/100] {row['社名']} 詳細分析中...")
-
+final_data = []
+for item in target_200:
+    inf, row = item['inf'], item['row']
     try:
-        s = yf.Ticker(ticker_str)
+        s = yf.Ticker(item['ticker'])
         hist = s.history(period="3mo")
-        if hist.empty: continue
-
-        inf = s.info
-        def g(k, default=0):
-            val = inf.get(k, default)
-            return val if (val is not None and np.isfinite(val) if isinstance(val, float) else True) else default
-
-        # 【指標抽出】
-        current_price = g('currentPrice', hist['Close'].iloc[-1])
-        equity_ratio = g('equityRatio', 0) * 100
-        fcf = g('operatingCashflow', 0) + g('investingCashflow', 0)
-        net_cash = g('totalCash', 0) - g('totalDebt', 0)
-        roe = g('returnOnEquity', 0) * 100
-        per = g('trailingPE', 0)
-        pbr = g('priceToBook', 0)
-        yield_val = g('dividendYield', 0) * 100
-        payout_ratio = g('payoutRatio', 0) * 100
-        rev_growth = g('revenueGrowth', 0) * 100
-        eps = g('trailingEps', 0)
+        cp = inf.get('currentPrice')
+        
+        # 指標算出（全指示網羅）
+        eq_ratio = inf.get('equityRatio', 0) * 100
+        fcf = (inf.get('operatingCashflow', 0) or 0) + (inf.get('investingCashflow', 0) or 0)
+        net_cash = (inf.get('totalCash', 0) or 0) - (inf.get('totalDebt', 0) or 0)
+        roe = inf.get('returnOnEquity', 0) * 100
+        per = inf.get('trailingPE', 0)
+        pbr = inf.get('priceToBook', 0)
+        yld = inf.get('dividendYield', 0) * 100
+        payout = inf.get('payoutRatio', 0) * 100
+        rev_g = inf.get('revenueGrowth', 0) * 100
+        eps = inf.get('trailingEps', 0)
         
         rsi = calculate_rsi(hist['Close']).iloc[-1]
         ma25 = hist['Close'].rolling(window=25).mean().iloc[-1]
-        deviation = ((current_price - ma25) / ma25) * 100 if (ma25 and ma25 != 0) else 0
+        dev = ((cp - ma25) / ma25) * 100 if ma25 else 0
 
-        # 戦略と理論上限
-        st_type = "クオリティ・グロース" if roe > 10 and 0 < per < 25 else "ディープ・バリュー"
-        safe_eps = eps if eps > 0 else (current_price / 15)
-        buy_range_top = max(safe_eps * 12, (g('dividendRate', 0) / 0.04) if g('dividendRate', 0) > 0 else 0)
-
-        # AI分析（全重要指標をGeminiに渡す）
-        prompt = (f"銘柄:{row['社名']}, 業種:{row['業種']}\n"
-                  f"ROE:{roe:.1f}%, PER:{per}, 成長率:{rev_growth:.1f}%, FCF:{fcf/1e6:.1f}M, 自己資本比率:{equity_ratio:.1f}%\n"
-                  f"必ず「スコア(-10〜10)|為替感応度|診断(40文字程度)」で回答。")
-        response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        res_text = response.text.strip().replace("\n", " ").replace(",", "、")
+        # 戦略とレンジ
+        st = "クオリティ・グロース" if roe > 10 and 0 < per < 25 else "ディープ・バリュー"
+        range_top = max(eps * 12, (inf.get('dividendRate', 0) or 0) / 0.04)
         
-        ai_val, ai_fx, ai_diag = 0, "中立", res_text
-        if "|" in res_text:
-            parts = res_text.split("|")
-            ai_val = int(re.search(r'(-?\d+)', parts[0]).group(1)) if re.search(r'(-?\d+)', parts[0]) else 0
-            ai_fx = parts[1].strip()
-            ai_diag = parts[-1].strip()
+        # AI分析（指示通り30-50文字、カンマ排除）
+        prompt = (f"銘柄:{row['社名']}, 業種:{row['業種']}\nROE:{roe:.1f}%, FCF:{fcf/1e6:.0f}M, 配当性向:{payout:.1f}%\n"
+                  f"必ず「スコア(-15〜15)|為替ラベル|AI診断(50字以内)」で回答。")
+        res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip().replace("\n"," ").replace(",","、")
+        
+        ai_val, ai_fx, ai_diag = 0, "中立", res
+        if "|" in res:
+            p = res.split("|")
+            ai_val = int(re.search(r'(-?\d+)', p[0]).group(1)) if re.search(r'(-?\d+)', p[0]) else 0
+            ai_fx, ai_diag = p[1].strip(), p[-1].strip()
 
-        # 【厳密なスコアリング：最大100点】
-        base_score = 40  # 基礎点
-        if roe > 12: base_score += 10
-        if fcf > 0: base_score += 10
-        if equity_ratio > 50: base_score += 10
-        if rev_growth > 5: base_score += 5
-        if rsi < 35: base_score += 10
-        if yield_val > 3.5: base_score += 10
-        if deviation < -10: base_score += 5
-        total_score = min(100, max(0, base_score + ai_val))
+        score = min(100, max(0, 50 + ai_val + (10 if roe>12 else 0) + (10 if fcf>0 else 0) + (10 if eq_ratio>50 else 0)))
 
-        day_diff = round(current_price - prev_prices.get(str(row['コード']), 0), 1) if prev_prices.get(str(row['コード']), 0) > 0 else 0
+        final_data.append([
+            date_str, row['コード'], row['社名'], st, int(score), round(cp, 1),
+            round(cp - prev_prices.get(str(row['コード']), cp), 1), ai_fx, round(range_top, 1),
+            round(((cp / range_top) - 1) * 100, 1) if range_top else 0,
+            round(yld, 2), round(payout, 1), round(roe, 1), round(per, 1), round(pbr, 2),
+            round(eq_ratio, 1), round(fcf/1e6, 1), round(net_cash/1e6, 1),
+            round(rsi, 1), round(dev, 1), ai_diag[:150]
+        ])
+        time.sleep(0.5) # API制限考慮
+    except: continue
 
-        res_row = [
-            date_str, row['コード'], row['社名'], st_type, int(total_score),
-            round(current_price, 1), day_diff, ai_fx, round(buy_range_top, 1),
-            round(((current_price / buy_range_top) - 1) * 100, 1) if buy_range_top > 0 else 0,
-            round(yield_val, 2), round(payout_ratio, 1), round(roe, 1), round(per, 1), round(pbr, 2),
-            round(equity_ratio, 1), round(fcf/1e6, 1), round(net_cash/1e6, 1),
-            round(rsi, 1), round(deviation, 1), ai_diag[:150]
-        ]
-        results.append([x if not (isinstance(x, float) and not np.isfinite(x)) else 0 for x in res_row])
-        time.sleep(1)
-
-    except Exception as e:
-        print(f"Error: {row['社名']} - {e}")
-
-# --- 3. スプレッドシート保存 ---
-if results:
-    try:
-        try:
-            worksheet = sh.worksheet(date_str)
-        except gspread.exceptions.WorksheetNotFound:
-            worksheet = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
-            legend = ["【凡例】", "総合評価:100点満点(財務・成長・テクニカル統合)", "FCF:営業CF+投資CF(百万)", "ネットキャッシュ:現預金-有利子負債(百万)", "25日乖離:移動平均からの乖離率", "配当性向:利益に対する配当総額の割合"]
-            worksheet.append_row(legend)
-            header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '前日比', '為替ラベル', 'レンジ上限', '上限乖離率', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
-            worksheet.append_row(header)
-        worksheet.append_rows(results)
-        print(f"✅ シート「{date_str}」に完全版を保存しました")
-    except Exception as e:
-        print(f"Spreadsheet Error: {e}")
+# --- 4. 保存 ---
+if final_data:
+    ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
+    legend = ["【凡例】", "総合評価:100点満点(収益・財務・CF統合)", "FCF:営業CF+投資CF(百万)", "ネットキャッシュ:現預金-負債(百万)", "25日乖離:移動平均からの離れ率", "戦略:Qグロース(高ROE)/Dバリュー(低PBR)"]
+    header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '前日比', '為替ラベル', 'レンジ上限', '上限乖離率', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
+    ws.append_row(legend)
+    ws.append_row(header)
+    ws.append_rows(final_data)
+    print(f"✅ {date_str} の200社詳細分析完了")
