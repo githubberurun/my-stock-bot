@@ -14,9 +14,10 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# --- 認証設定 ---
+# --- 設定 ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID') # IDでの指定を優先
 
 client = Client(api_key=GEMINI_API_KEY)
 json_data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -34,11 +35,11 @@ def get_latest_jpx_list():
 
 # --- 1. スキャン (200社選抜) ---
 df_all = get_latest_jpx_list()
-print("📡 「Github用」スプレッドシートへの精密分析を開始...")
+print("📡 全3800社から Blue-Chip と Deep Value 候補を抽出...")
 tickers = [f"{str(c).strip()}.T" for c in df_all['コード']]
 selected_data = []
 
-# 時価総額上位から200社を取得
+# 時価総額上位から200社を確定
 for i in range(0, 400, 100):
     batch = tickers[i:i+100]
     data = yf.download(batch, period="2d", group_by='ticker', threads=True, progress=False)
@@ -59,20 +60,23 @@ final_rows = []
 header = ['日付', 'コード', '社名', '戦略', '総合評価', '現在値', '前日比', '為替ラベル', 'レンジ上限', '利回り', '配当性向', 'ROE', 'PER', 'PBR', '自己資本比率', 'FCF(百万)', 'ネットキャッシュ', 'RSI', '25日乖離', 'AI深層診断']
 date_str = (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d")
 
-# スプレッドシート「Github用」を開く
+# スプレッドシート接続（ID優先、失敗したら名前で検索）
 gc = gspread.authorize(creds)
 try:
-    sh = gc.open('Github用') # スプレッドシート名で直接開く
-except Exception as e:
-    print(f"❌ スプレッドシート 'Github用' が見つかりません: {e}")
-    exit()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+except:
+    try: sh = gc.open('Github用')
+    except Exception as e:
+        print(f"❌ スプレッドシートの接続に失敗: {e}")
+        exit()
 
 try:
     ws = sh.add_worksheet(title=date_str, rows="1000", cols="25", index=0)
 except:
-    ws = sh.worksheet(date_str)
-    ws.clear()
+    ws = sh.worksheet(date_str); ws.clear()
 ws.append_row(header)
+
+print("🤖 分析を開始します...")
 
 for i, item in enumerate(selected_data[:200]):
     try:
@@ -80,10 +84,10 @@ for i, item in enumerate(selected_data[:200]):
         inf = s.info
         hist = s.history(period="3mo")
         
-        # 専門用語での戦略書き分け
+        # 戦略名を専門用語で確定
         strategy = "Blue-Chip Strategy" if i < 100 else "Deep Value Strategy"
         
-        # 指標ロジック
+        # 財務指標ロジック
         roe = float(inf.get('returnOnEquity', 0)) * 100
         yld = float(inf.get('dividendYield', 0)) * 100
         fcf = (float(inf.get('operatingCashflow', 0)) + float(inf.get('investingCashflow', 0))) / 1e6
@@ -101,7 +105,7 @@ for i, item in enumerate(selected_data[:200]):
             dev = ((close.iloc[-1] - close.rolling(25).mean().iloc[-1]) / close.rolling(25).mean().iloc[-1]) * 100
 
         # AI分析
-        prompt = f"銘柄:{item['row']['社名']}, 業種:{item['row']['業種']}, ROE:{roe:.1f}%。為替影響を判定し「スコア|為替|診断(40字)」で回答。"
+        prompt = f"銘柄:{item['row']['社名']}, 業種:{item['row']['業種']}, ROE:{roe:.1f}%。為替影響を含め「スコア|為替|診断(40字)」で回答。"
         res = client.models.generate_content(model='gemini-2.0-flash', contents=prompt).text.strip()
         
         ai_s, ai_fx, ai_d = 0, "中立", res
@@ -118,10 +122,10 @@ for i, item in enumerate(selected_data[:200]):
         
         if len(final_rows) % 10 == 0:
             ws.append_rows(final_rows[-10:])
-            print(f"✅ {len(final_rows)}/200 ({strategy}) 完了")
+            print(f"✅ {len(final_rows)}/200 完了")
     except: continue
 
-# 同時にCSVとしてもDriveのstock_dataフォルダ等へ保存（バックアップ）
+# 同期
 drive_service = build('drive', 'v3', credentials=creds)
 csv_buf = io.BytesIO()
 pd.DataFrame(final_rows, columns=header).to_csv(csv_buf, index=False, encoding='utf-8-sig')
